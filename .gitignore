@@ -1,3 +1,5 @@
+.gitignore
+.gitattributes
 obj/
 bin/
 src/gfx/*.c

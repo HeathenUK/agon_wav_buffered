@@ -201,6 +201,16 @@ uint24_t strtou24(const char *str) {
 }
 
 typedef struct {
+
+	uint32_t dataOffset;
+	uint32_t dataSize;
+	uint32_t samples;
+	uint16_t duration;
+    uint8_t  code;
+
+} xHeader;
+
+typedef struct {
     char     chunkId[4];
     uint32_t chunkSize;
     char     format[4];
@@ -212,8 +222,8 @@ typedef struct {
     uint32_t byteRate;
     uint16_t blockAlign;
     uint16_t bitsPerSample;
-	uint32_t dataOffset;
-	uint32_t dataSize;
+	xHeader  extra_header;
+
 } WavHeader;
 
 WavHeader parse_wav(FILE *file) {
@@ -222,18 +232,23 @@ WavHeader parse_wav(FILE *file) {
     
 	fseek(file, 0, SEEK_SET);
 
-    // Read WAV header (less the dataOffset and dataSize fields)
-	fread(&header, 1, sizeof(WavHeader) - (sizeof(uint32_t) * 2), file);
+    // Read WAV header (less the extra header fields)
+	fread(&header, 1, sizeof(WavHeader) - sizeof(xHeader), file);
 
     // Check if it's a WAV file
     if (strncmp(header.chunkId, "RIFF", 4) != 0 || strncmp(header.format, "WAVE", 4) != 0) {
-        header.dataOffset = (uint32_t)-1; // Not a WAV file
+        header.extra_header.code = 1; // Not a WAV file
         return header;
     }
 
     // Check if it's PCM audio
     if (header.audioFormat != 1) {
-        header.dataOffset = (uint32_t)-2; // Not PCM
+        header.extra_header.code = 2; // Not PCM
+        return header;
+    }
+
+    if (!(header.numChannels == 1 || header.numChannels == 2)) {
+        header.extra_header.code = 4; // Sorry, I don't support 5.1 surround sound!
         return header;
     }
 
@@ -249,8 +264,8 @@ WavHeader parse_wav(FILE *file) {
         if (readCount < 1) break;
 
         if (strncmp(subChunkId, "data", 4) == 0) {
-            header.dataSize = subChunkSize;
-			header.dataOffset = ftell(file);
+            header.extra_header.dataSize = subChunkSize;
+			header.extra_header.dataOffset = ftell(file);
             dataFound = 1;
             break;
         }
@@ -261,18 +276,36 @@ WavHeader parse_wav(FILE *file) {
 
     if (!dataFound) {
         printf("Error: 'data' chunk not found.\n");
-        header.dataOffset = (uint32_t)-3; // Error code for data chunk not found
+        header.extra_header.code = 3; // Error code for data chunk not found
     }	
+
+    header.extra_header.duration = header.extra_header.dataSize / header.numChannels / (header.sampleRate / 1000);
 
     return header; // Success
 }
 
 #define CHUNK_SIZE 4096
 
+uint8_t* convertStereoToMono(uint8_t *stereoBuffer, int numFrames) {
+
+    uint8_t *monoBuffer = (uint8_t*) malloc(numFrames * sizeof(uint8_t));
+    if (monoBuffer == NULL) {
+        return NULL;
+    }
+
+    for (int i = 0; i < numFrames; ++i) {
+        monoBuffer[i] = (stereoBuffer[2 * i] + stereoBuffer[2 * i + 1]) / 2;
+    }
+
+    return monoBuffer;
+}
+
 void upload_pcm(FILE *file, WavHeader *header, uint16_t sample_id) {
 
-	uint24_t chunk, remaining_data;
+	uint24_t chunk;
+    int24_t remaining_data;
 	uint8_t *sample_buffer = (uint8_t *) malloc(CHUNK_SIZE);
+    uint8_t *downsampled_buffer = NULL;
 	//uint8_t sample_buffer[CHUNK_SIZE];
 
 	if (sample_buffer == NULL) {
@@ -282,8 +315,8 @@ void upload_pcm(FILE *file, WavHeader *header, uint16_t sample_id) {
 
 	}
 		
-	remaining_data = header->dataSize;
-	fseek(file, header->dataOffset, SEEK_CUR);
+	remaining_data = header->extra_header.dataSize;
+	fseek(file, header->extra_header.dataOffset, SEEK_CUR);
 
 	clear_buffer(sample_id);
 		
@@ -293,8 +326,22 @@ void upload_pcm(FILE *file, WavHeader *header, uint16_t sample_id) {
 			chunk = CHUNK_SIZE;
 		} else chunk = remaining_data;
 		
-		fread(sample_buffer, 1, chunk, file);
-		add_stream_to_buffer(sample_id, sample_buffer, chunk);
+		fread(sample_buffer, 1, chunk * (header->bitsPerSample / 8), file);
+
+        if (header->numChannels == 1) add_stream_to_buffer(sample_id, sample_buffer, chunk);
+        else if (header->numChannels == 2) {
+            int stereo_samples = chunk / 2;
+
+            uint8_t *monoBuffer = convertStereoToMono(sample_buffer, stereo_samples);
+            if (monoBuffer != NULL) {
+                add_stream_to_buffer(sample_id, monoBuffer, stereo_samples);
+                free(monoBuffer);
+            }
+            else {
+                printf("Memory allocation failed for mono buffer.\n");
+            }
+        }
+
 		remaining_data -= chunk;
 	
 	}
@@ -318,6 +365,7 @@ typedef struct {
 	uint8_t channel;
 	bool info;
 	uint8_t volume;
+    uint8_t repeat;
 } cli;
 
 typedef struct {
@@ -335,11 +383,12 @@ arg_map args[] = {
     { .keys = (char *[]){ "-loop", "-l" },		.num_keys = 2, .ptr = NULL, .type = 'f', .is_set = false },
     { .keys = (char *[]){ "-channel", "-c" },	.num_keys = 2, .ptr = NULL, .type = 'i', .is_set = false },
     { .keys = (char *[]){ "-info", "-i" },		.num_keys = 2, .ptr = NULL, .type = 'f', .is_set = false },
-	{ .keys = (char *[]){ "-volume", "-v" },	.num_keys = 2, .ptr = NULL, .type = 'i', .is_set = false }
+	{ .keys = (char *[]){ "-volume", "-v" },	.num_keys = 2, .ptr = NULL, .type = 'i', .is_set = false },
+    { .keys = (char *[]){ "-repeat", "-r" },	.num_keys = 2, .ptr = NULL, .type = 'i', .is_set = false }
 };
 
 void parse_args(int argc, char *argv[], cli *cli) {
-    // Initialize pointers in args
+    
     args[0].ptr = &cli->file;
 	args[1].ptr = &cli->buffer;
 	args[2].ptr = &cli->play;
@@ -347,6 +396,7 @@ void parse_args(int argc, char *argv[], cli *cli) {
 	args[4].ptr = &cli->channel;
 	args[5].ptr = &cli->info;
 	args[6].ptr = &cli->volume;
+    args[7].ptr = &cli->repeat;
 
     for (int i = 1; i < argc; ++i) {
         for (int j = 0; j < sizeof(args) / sizeof(arg_map); ++j) {
@@ -393,6 +443,7 @@ int main(int argc, char * argv[])
 	// args[4].ptr = &cli->channel;
 	// args[5].ptr = &cli->info;
 	// args[6].ptr = &cli->volume;
+    // args[7].ptr = &cli->repeat;
 
 	//Debug
 
@@ -400,6 +451,20 @@ int main(int argc, char * argv[])
 	// printf("Is sets: %d %d %d %d %d %d\r\n", args[0].is_set, args[1].is_set, args[2].is_set, args[3].is_set, args[4].is_set, args[5].is_set);
 
 	//End debug
+
+	if (argc > 1 && !args[0].is_set) {
+		char ext[] = ".wav";
+		char test[5];
+		
+		strncpy(test, argv[1] + (strlen(argv[1]) - 4), 4);
+		test[4] = '\0';
+		to_lowercase(test);
+		
+		if (strncmp(test, ext, 4) == 0) {
+			params.file = argv[1];
+			args[0].is_set = true;
+		}
+	}
 
 	if (!args[0].is_set) {
 
@@ -417,7 +482,7 @@ int main(int argc, char * argv[])
 	WavHeader header = parse_wav(file);
 
 	if (args[5].is_set) {
-		printf("Format %u, Channels %u, Samplerate %lu, Offset %lu, Size %lu bytes.\r\n", header.audioFormat, header.numChannels, header.sampleRate, header.dataOffset, header.dataSize);
+		printf("Format %u, Channels %u, Samplerate %lu, Offset %lu, Size %lu bytes, Calculated duration (ms) %u.\r\n", header.audioFormat, header.numChannels, header.sampleRate, header.extra_header.dataOffset, header.extra_header.dataSize, header.extra_header.duration);
 		fclose(file);
 		return 0;
 	}
@@ -431,6 +496,7 @@ int main(int argc, char * argv[])
 		uint8_t volume = 100;
 
 		if (args[3].is_set) duration = -1;
+        if (args[7].is_set) duration = params.repeat * header.extra_header.duration;
 		if (args[6].is_set) volume = params.volume;
 
 		if (args[4].is_set && args[1].is_set) play_sample(params.buffer, params.channel, volume, duration);
