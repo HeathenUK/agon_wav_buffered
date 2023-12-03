@@ -1,12 +1,3 @@
-/*
- * Title:			Hello World - C example
- * Author:			Dean Belfield
- * Created:			22/06/2022
- * Last Updated:	22/11/2022
- *
- * Modinfo:
- */
- 
 #include <stdio.h>
 #include <stdlib.h>
 #include <ctype.h>
@@ -15,10 +6,9 @@
 #include <agon/vdp_vdu.h>
 #include <agon/vdp_key.h>
 
-// Parameters:
-// - argc: Argument count
-// - argv: Pointer to the argument string - zero terminated, parameters separated by spaces
-//
+#define DEFAULT_CHUNK_SIZE 8192
+
+extern void fast_vdu(uint8_t *data, int len);
 
 void write16bit(uint16_t w)
 {
@@ -26,7 +16,7 @@ void write16bit(uint16_t w)
 	putch(w >> 8);	 // write MSB	
 }
 
-void add_stream_to_buffer(uint16_t buffer_id, char* buffer_content, uint16_t buffer_size) {	
+void add_stream_to_buffer(uint16_t buffer_id, char* buffer_content, uint16_t buffer_size, bool quick) {	
 
 	putch(23);
 	putch(0);
@@ -35,7 +25,8 @@ void add_stream_to_buffer(uint16_t buffer_id, char* buffer_content, uint16_t buf
 	putch(0);
 	write16bit(buffer_size);
 	
-	mos_puts(buffer_content, buffer_size, 0);
+	if (quick) fast_vdu(buffer_content, buffer_size);
+    else mos_puts(buffer_content, buffer_size, 0);
 
 }
 
@@ -284,8 +275,6 @@ WavHeader parse_wav(FILE *file) {
     return header; // Success
 }
 
-#define CHUNK_SIZE 4096
-
 uint8_t* convertStereoToMono(uint8_t *stereoBuffer, int numFrames) {
 
     uint8_t *monoBuffer = (uint8_t*) malloc(numFrames * sizeof(uint8_t));
@@ -300,12 +289,91 @@ uint8_t* convertStereoToMono(uint8_t *stereoBuffer, int numFrames) {
     return monoBuffer;
 }
 
-void upload_pcm(FILE *file, WavHeader *header, uint16_t sample_id) {
+void stream_pcm(FILE *file, WavHeader *header, uint16_t sample_id, uint16_t chunk_size, uint8_t channel_id, uint8_t volume, uint16_t duration, bool quick) {
+
+//stream_pcm(params.buffer = sample_id, params.channel, volume, duration);
+
+    if (chunk_size == 0) chunk_size = DEFAULT_CHUNK_SIZE;
 
 	uint24_t chunk;
     int24_t remaining_data;
-	uint8_t *sample_buffer = (uint8_t *) malloc(CHUNK_SIZE);
-    uint8_t *downsampled_buffer = NULL;
+	uint8_t *sample_buffer = (uint8_t *) malloc(chunk_size);
+	//uint8_t sample_buffer[CHUNK_SIZE];
+
+	if (sample_buffer == NULL) {
+
+		printf("Failed to malloc");
+		return;
+
+	}
+		
+	remaining_data = header->extra_header.dataSize;
+	fseek(file, header->extra_header.dataOffset, SEEK_CUR);
+
+	clear_buffer(sample_id);
+
+    if (remaining_data > chunk_size) {
+        chunk = chunk_size;
+    } else chunk = remaining_data;
+    
+    fread(sample_buffer, 1, chunk * (header->bitsPerSample / 8), file);
+
+    if (header->numChannels == 1) add_stream_to_buffer(sample_id, sample_buffer, chunk, quick);
+    else if (header->numChannels == 2) {
+        int stereo_samples = chunk / 2;
+
+        uint8_t *monoBuffer = convertStereoToMono(sample_buffer, stereo_samples);
+        if (monoBuffer != NULL) {
+            add_stream_to_buffer(sample_id, monoBuffer, stereo_samples, quick);
+            free(monoBuffer);
+        }
+        else {
+            printf("Memory allocation failed for mono buffer.\n");
+        }
+    }
+
+    remaining_data -= chunk;
+
+    sample_from_buffer(sample_id, 1);
+    play_sample(sample_id, channel_id, volume, duration);
+    	
+	while (remaining_data > 0) {
+		
+		if (remaining_data > chunk_size) {
+			chunk = chunk_size;
+		} else chunk = remaining_data;
+		
+		fread(sample_buffer, 1, chunk * (header->bitsPerSample / 8), file);
+
+        if (header->numChannels == 1) add_stream_to_buffer(sample_id, sample_buffer, chunk, quick);
+        else if (header->numChannels == 2) {
+            int stereo_samples = chunk / 2;
+
+            uint8_t *monoBuffer = convertStereoToMono(sample_buffer, stereo_samples);
+            if (monoBuffer != NULL) {
+                add_stream_to_buffer(sample_id, monoBuffer, stereo_samples, quick);
+                free(monoBuffer);
+            }
+            else {
+                printf("Memory allocation failed for mono buffer.\n");
+            }
+        }
+
+		remaining_data -= chunk;
+	
+	}
+
+	free(sample_buffer);
+
+}
+
+void upload_pcm(FILE *file, WavHeader *header, uint16_t sample_id, uint16_t chunk_size, bool quick) {
+
+    if (chunk_size == 0) chunk_size = DEFAULT_CHUNK_SIZE;
+
+	uint24_t chunk;
+    int24_t remaining_data;
+	uint8_t *sample_buffer = (uint8_t *) malloc(chunk_size);
 	//uint8_t sample_buffer[CHUNK_SIZE];
 
 	if (sample_buffer == NULL) {
@@ -322,19 +390,19 @@ void upload_pcm(FILE *file, WavHeader *header, uint16_t sample_id) {
 		
 	while (remaining_data > 0) {
 		
-		if (remaining_data > CHUNK_SIZE) {
-			chunk = CHUNK_SIZE;
+		if (remaining_data > chunk_size) {
+			chunk = chunk_size;
 		} else chunk = remaining_data;
 		
 		fread(sample_buffer, 1, chunk * (header->bitsPerSample / 8), file);
 
-        if (header->numChannels == 1) add_stream_to_buffer(sample_id, sample_buffer, chunk);
+        if (header->numChannels == 1) add_stream_to_buffer(sample_id, sample_buffer, chunk, quick);
         else if (header->numChannels == 2) {
             int stereo_samples = chunk / 2;
 
             uint8_t *monoBuffer = convertStereoToMono(sample_buffer, stereo_samples);
             if (monoBuffer != NULL) {
-                add_stream_to_buffer(sample_id, monoBuffer, stereo_samples);
+                add_stream_to_buffer(sample_id, monoBuffer, stereo_samples, quick);
                 free(monoBuffer);
             }
             else {
@@ -366,6 +434,9 @@ typedef struct {
 	bool info;
 	uint8_t volume;
     uint8_t repeat;
+    uint16_t chunk;
+    bool stream;
+    bool quick;
 } cli;
 
 typedef struct {
@@ -377,14 +448,17 @@ typedef struct {
 } arg_map;
 
 arg_map args[] = {
-    { .keys = (char *[]){ "-file", "-f" },		.num_keys = 2, .ptr = NULL, .type = 's', .is_set = false },
-    { .keys = (char *[]){ "-buffer", "-b" },	.num_keys = 2, .ptr = NULL, .type = 'i', .is_set = false },
-    { .keys = (char *[]){ "-play", "-p" },		.num_keys = 2, .ptr = NULL, .type = 'f', .is_set = false },
-    { .keys = (char *[]){ "-loop", "-l" },		.num_keys = 2, .ptr = NULL, .type = 'f', .is_set = false },
-    { .keys = (char *[]){ "-channel", "-c" },	.num_keys = 2, .ptr = NULL, .type = 'i', .is_set = false },
-    { .keys = (char *[]){ "-info", "-i" },		.num_keys = 2, .ptr = NULL, .type = 'f', .is_set = false },
-	{ .keys = (char *[]){ "-volume", "-v" },	.num_keys = 2, .ptr = NULL, .type = 'i', .is_set = false },
-    { .keys = (char *[]){ "-repeat", "-r" },	.num_keys = 2, .ptr = NULL, .type = 'i', .is_set = false }
+    { .keys = (char *[]){ "--file", "-f" },		.num_keys = 2, .ptr = NULL, .type = 's', .is_set = false },
+    { .keys = (char *[]){ "--buffer", "-b" },	.num_keys = 2, .ptr = NULL, .type = 'i', .is_set = false },
+    { .keys = (char *[]){ "--play", "-p" },		.num_keys = 2, .ptr = NULL, .type = 'f', .is_set = false },
+    { .keys = (char *[]){ "--loop", "-l" },		.num_keys = 2, .ptr = NULL, .type = 'f', .is_set = false },
+    { .keys = (char *[]){ "--channel", "-c" },	.num_keys = 2, .ptr = NULL, .type = 'i', .is_set = false },
+    { .keys = (char *[]){ "--info", "-i" },		.num_keys = 2, .ptr = NULL, .type = 'f', .is_set = false },
+	{ .keys = (char *[]){ "--volume", "-v" },	.num_keys = 2, .ptr = NULL, .type = 'i', .is_set = false },
+    { .keys = (char *[]){ "--repeat", "-r" },	.num_keys = 2, .ptr = NULL, .type = 'i', .is_set = false },
+    { .keys = (char *[]){ "--upload", "-u" },	.num_keys = 2, .ptr = NULL, .type = 'i', .is_set = false },
+    { .keys = (char *[]){ "--stream", "-s" },	.num_keys = 2, .ptr = NULL, .type = 'f', .is_set = false },
+    { .keys = (char *[]){ "--quick", "-q" },	.num_keys = 2, .ptr = NULL, .type = 'f', .is_set = false }
 };
 
 void parse_args(int argc, char *argv[], cli *cli) {
@@ -397,9 +471,12 @@ void parse_args(int argc, char *argv[], cli *cli) {
 	args[5].ptr = &cli->info;
 	args[6].ptr = &cli->volume;
     args[7].ptr = &cli->repeat;
+    args[8].ptr = &cli->chunk;
+    args[9].ptr = &cli->stream;
+    args[10].ptr = &cli->quick;
 
     for (int i = 1; i < argc; ++i) {
-        for (int j = 0; j < sizeof(args) / sizeof(arg_map); ++j) {
+        for (unsigned int j = 0; j < sizeof(args) / sizeof(arg_map); ++j) {
             for (int k = 0; k < args[j].num_keys; ++k) {
                 if (strcmp(argv[i], args[j].keys[k]) == 0) {
                     args[j].is_set = true;  // Mark as set
@@ -444,6 +521,8 @@ int main(int argc, char * argv[])
 	// args[5].ptr = &cli->info;
 	// args[6].ptr = &cli->volume;
     // args[7].ptr = &cli->repeat;
+    // args[8].ptr = &cli->upload_chunk;
+    // args[9].ptr = &cli->stream;
 
 	//Debug
 
@@ -451,6 +530,8 @@ int main(int argc, char * argv[])
 	// printf("Is sets: %d %d %d %d %d %d\r\n", args[0].is_set, args[1].is_set, args[2].is_set, args[3].is_set, args[4].is_set, args[5].is_set);
 
 	//End debug
+
+    if (argc == 1) printf("Usage: wavb file.wav\r\nOptions:\r\n\r\n--file or -f:     specify filename (first parameter if not set).\r\n--buffer or -b:   specify buffer id for sample.\r\n--play or -p:     playback after upload.\r\n--loop or -l:     loop audio playback.\r\n--repeat or -r:   repeat sample n times.\r\n--channel or -l:  channel for playback, default 0.\r\n--volume or -v:   volume for playback.\r\n--upload or -u:   upload chunk size (default 4K).\r\n--info or -i:     print debug info.\r\n");
 
 	if (argc > 1 && !args[0].is_set) {
 		char ext[] = ".wav";
@@ -483,17 +564,42 @@ int main(int argc, char * argv[])
 
 	if (args[5].is_set) {
 		printf("Format %u, Channels %u, Samplerate %lu, Offset %lu, Size %lu bytes, Calculated duration (ms) %u.\r\n", header.audioFormat, header.numChannels, header.sampleRate, header.extra_header.dataOffset, header.extra_header.dataSize, header.extra_header.duration);
-		fclose(file);
-		return 0;
+		//fclose(file);
+		//return 0;
 	}
-	
-	if (args[1].is_set) upload_pcm(file, &header, params.buffer);
-	else upload_pcm(file, &header, 0);
-	
-	if (args[2].is_set) { //Playback is requested
 
-		int16_t duration = 0;
-		uint8_t volume = 100;
+	int16_t duration = 0;
+	uint8_t volume = 100;
+    bool quick = false;
+
+    if (!args[8].is_set) params.chunk = DEFAULT_CHUNK_SIZE;
+    if (args[10].is_set) quick = true;
+
+    if (args[9].is_set) { //Streaming is requested
+
+        duration = header.extra_header.duration;
+		if (args[3].is_set) duration = -1;
+        if (args[7].is_set) duration = params.repeat * header.extra_header.duration;
+		if (args[6].is_set) volume = params.volume;
+
+		if (args[4].is_set && args[1].is_set) stream_pcm(file, &header, params.buffer, params.chunk, params.channel, volume, duration, quick);
+		else if (args[4].is_set && !args[1].is_set) stream_pcm(file, &header, 0, params.chunk, params.channel, volume, duration, quick);
+		else if (!args[4].is_set && args[1].is_set) stream_pcm(file, &header, params.buffer, params.chunk, 0, volume, duration, quick);
+		else stream_pcm(file, &header, 0, params.chunk, 0, volume, duration, quick);
+
+        fclose(file);
+        return 0; 
+
+    }
+
+    //All other modes require uploading in one go
+
+    float before = (float)sv->time;
+    if (args[1].is_set) upload_pcm(file, &header, params.buffer, params.chunk, quick);
+	else upload_pcm(file, &header, 0, params.chunk, quick);
+    if (args[5].is_set) printf("Seconds for upload: %.1f\r\n", ((float)sv->time - before) / 100);
+    
+    if (args[2].is_set) { //Playback is requested
 
 		if (args[3].is_set) duration = -1;
         if (args[7].is_set) duration = params.repeat * header.extra_header.duration;
